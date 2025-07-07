@@ -4,7 +4,6 @@ GREEN='\033[0;32m'
 NC='\033[0m'
 
 LOGFILE="/var/tmp/ipv6-proxy-server-install.log"
-exec > $LOGFILE 2>&1
 
 # Пути и глобальные переменные
 cd ~
@@ -18,7 +17,7 @@ random_users_list_file="$proxy_dir/random_users.list"
 startup_script_path="$proxy_dir/proxy-startup.sh"
 cron_script_path="$proxy_dir/proxy-server.cron"
 backconnect_proxies_file="$proxy_dir/backconnect_proxies.list"
-interface_name="$(ip -br l | awk '$1 !~ \"lo|vir|wl|@NONE\" { print \$1 }' | awk 'NR==1')"
+interface_name="$(ip -br l | awk '$1 !~ "lo|vir|wl|@NONE" { print $1 }' | awk 'NR==1')"
 start_port=30000
 ipv6_random64_file="$proxy_dir/active_64_subnet.txt"
 conf_file="$proxy_dir/proxyserver.conf"
@@ -171,7 +170,6 @@ generate_random_users_if_needed() {
 create_startup_script() {
   rm -f $startup_script_path
 
-  is_auth_used; local use_auth=$?
   cat > $startup_script_path <<-EOF
   #!$(which bash)
   proxyserver_process_pids=()
@@ -295,6 +293,15 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
+# Первый запуск: если нет конфига, спросить всё и сохранить
+if ! load_settings; then
+    get_user_input
+    save_settings
+fi
+
+# Теперь весь вывод в лог
+exec > $LOGFILE 2>&1
+
 echo "* hard nofile 999999" >> /etc/security/limits.conf
 echo "* soft nofile 999999" >> /etc/security/limits.conf
 echo "net.ipv4.route.min_adv_mss = 1460" >> /etc/sysctl.conf
@@ -347,12 +354,6 @@ if [[ $1 == "--daily64" ]]; then
     write_backconnect_proxies_to_file
     mv $proxy_dir/backconnect_proxies.list $proxy_dir/proxy.txt
     exit 0
-fi
-
-# Первый запуск: если нет конфига, спросить всё и сохранить
-if ! load_settings; then
-    get_user_input
-    save_settings
 fi
 
 # Далее всегда брать параметры из конфига
