@@ -1,165 +1,161 @@
 #!/bin/bash
 
-# ---- КОНФИГ ----
-IPV6_SUPERNET="2a12:5940:e02e::"      # <- Впиши свою /48 подсеть БЕЗ /48!
-SUPERNET_PREFIX=48
-DAILY64_FILE="/root/proxyserver/daily64.txt"
-PROXY_COUNT=300
+# ============== НАСТРОЙКИ ================
+PROXY_DIR="$HOME/proxyserver"
+MAIN_SUBNET_48="2a12:5940:e02e::"
+CUR64_FILE="$PROXY_DIR/.current_64"
 START_PORT=30000
-ROTATE_MINUTES=5
-PROXY_TYPE="http"                    # или socks5
+PROXY_COUNT=400
+PROXIES_TYPE="http"
+ROTATING_INTERVAL=5
+USER="ojrhgji3"
+PASS="38u8r4hujr"
+MODE_FLAG="-6"
 INTERFACE_NAME="$(ip -br l | awk '$1 !~ "lo|vir|wl|@NONE" { print $1 }' | awk 'NR==1')"
-BACKCONNECT_IPV4="$(hostname -I | awk '{print $1}')"
-USER="user"
-PASS="pass"
-USE_RANDOM_AUTH=true # true/false
 
-mkdir -p /root/proxyserver
+mkdir -p "$PROXY_DIR"
 
-# ---- ФУНКЦИЯ: Случайная новая /64 из /48 ----
-generate_daily_64() {
-    RAND_HEX=$(printf "%x" $((RANDOM % 65536)))
-    SUBNET_HEX=$(printf "%04x" "0x$RAND_HEX")
-    DAILY64="${IPV6_SUPERNET%::}:${SUBNET_HEX}::/64"
-    echo "$DAILY64" > "$DAILY64_FILE"
-    echo "$DAILY64"
+# ============== Ротация /64 ================
+gen64_from48() {
+    HEX=$(cat /dev/urandom | tr -dc 'a-f0-9' | head -c4)
+    echo "${MAIN_SUBNET_48}${HEX}::/64"
 }
 
-get_or_generate_daily_64() {
-    if [ -f "$DAILY64_FILE" ]; then
-        MOD_DAY=$(stat -c %Y "$DAILY64_FILE")
-        NOW=$(date +%s)
-        AGE=$(( (NOW - MOD_DAY) / 86400 ))
-        if (( AGE >= 1 )); then
-            generate_daily_64
-        else
-            cat "$DAILY64_FILE"
-        fi
+# Только для смены /64 по крону
+if [[ "$1" == "--daily64" ]]; then
+    subnet=$(gen64_from48)
+    echo "$subnet" > "$CUR64_FILE"
+    exit 0
+fi
+
+# Получить /64 (если нет, сгенерировать)
+if [[ -f "$CUR64_FILE" ]]; then
+    last_mod=$(stat -c %Y "$CUR64_FILE")
+    now=$(date +%s)
+    age=$(( (now - last_mod) / 3600 ))
+    if (( $age < 24 )); then
+        subnet=$(cat "$CUR64_FILE")
     else
-        generate_daily_64
+        subnet=$(gen64_from48)
+        echo "$subnet" > "$CUR64_FILE"
     fi
-}
+else
+    subnet=$(gen64_from48)
+    echo "$subnet" > "$CUR64_FILE"
+fi
 
-gen_random_ipv6_in_64() {
-    local prefix64=$1
-    local suffix=""
-    for i in {1..4}; do
-        suffix="${suffix}:$(printf "%x" $((RANDOM % 65536)))"
-    done
-    echo "${prefix64%%::*}${suffix}"
-}
+# Крон на ежедневную смену /64
+CRON_MARK="#ipv6_rotate_subnet64"
+MYCRON="0 0 * * * bash $0 --daily64 $CRON_MARK"
+(crontab -l 2>/dev/null | grep -v "$CRON_MARK" ; echo "$MYCRON" ) | crontab -
 
-main() {
-    CUR64=$(get_or_generate_daily_64)
-    PREFIX64="${CUR64%/64}"
-    echo "Используем подсеть: $CUR64"
-
-    IP_LIST="/root/proxyserver/ipv6.list"
-    if [ -f "$IP_LIST" ]; then
-        for ip in $(cat "$IP_LIST"); do
-            ip -6 addr del "$ip" dev "$INTERFACE_NAME"
-        done
-        rm "$IP_LIST"
+# ============ УСТАНОВКА ЗАВИСИМОСТЕЙ ============
+required_packages=("openssl" "zip" "curl" "jq")
+for package in "${required_packages[@]}"; do
+    if ! dpkg -l | grep -q "^ii  $package "; then
+        echo "Устанавливаем $package..."
+        apt-get update -qq
+        apt-get install -y $package
     fi
+done
 
-    # Генерим новые ip6
-    for ((i=0; i<$PROXY_COUNT; i++)); do
-        newip=$(gen_random_ipv6_in_64 "$PREFIX64")
-        echo "$newip" >> "$IP_LIST"
-        ip -6 addr add "$newip" dev "$INTERFACE_NAME"
-    done
+if [ "$EUID" -ne 0 ]; then
+  echo "Please run as root"
+  exit 1
+fi
 
-    # --- ГЕНЕРАЦИЯ КОНФИГА 3proxy ---
-    port=$START_PORT
-    PROXY_TXT="/root/proxyserver/proxy.txt"
-    PROXY_CFG="/root/proxyserver/3proxy.cfg"
-    > $PROXY_TXT
-    > $PROXY_CFG
+# ========== УБРАТЬ СТАРЫЕ IPv6 С ИНТЕРФЕЙСА ==========
+RANDOM_IPV6_LIST_FILE="$PROXY_DIR/ipv6.list"
+rm -f $RANDOM_IPV6_LIST_FILE
+for addr in $(ip -6 addr show dev $INTERFACE_NAME | grep "inet6 " | awk '{print $2}' | grep ":$"); do
+    ip -6 addr del ${addr} dev $INTERFACE_NAME 2>/dev/null
+done
 
-    cat >> $PROXY_CFG <<EOF
+# ========== ГЕНЕРАЦИЯ IPv6 АДРЕСОВ ==========
+prefix6=$(echo $subnet | cut -d'/' -f1 | awk -F: '{printf "%s:%s:%s:%s:%s:%s", $1, $2, $3, $4, $5, $6}')
+for i in $(seq 1 $PROXY_COUNT); do
+    hex1=$(cat /dev/urandom | tr -dc 'a-f0-9' | head -c4)
+    hex2=$(cat /dev/urandom | tr -dc 'a-f0-9' | head -c4)
+    ip6="$prefix6:$hex1:$hex2"
+    echo $ip6 >> $RANDOM_IPV6_LIST_FILE
+    ip -6 addr add $ip6 dev $INTERFACE_NAME 2>/dev/null
+done
+
+# ============= КОНФИГ 3PROXY ================
+mkdir -p "$PROXY_DIR/3proxy"
+PROXY_CFG="$PROXY_DIR/3proxy/3proxy.cfg"
+
+cat > $PROXY_CFG <<EOF
 daemon
-maxconn 200
 nserver 1.1.1.1
+maxconn 200
 nscache 65536
 timeouts 1 5 30 60 180 1800 15 60
 setgid 65535
 setuid 65535
+auth strong
+users $USER:CL:$PASS
+allow *
 EOF
 
-    # Генерация пользователей если USE_RANDOM_AUTH
-    if [ "$USE_RANDOM_AUTH" = true ]; then
-        > /root/proxyserver/users.list
-        for ((i=0; i<$PROXY_COUNT; i++)); do
-            RANDUSER=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 8)
-            RANDPASS=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 8)
-            echo "$RANDUSER:CL:$RANDPASS" >> /root/proxyserver/users.list
-        done
-        echo "auth strong" >> $PROXY_CFG
-        echo "users $(paste -sd, /root/proxyserver/users.list)" >> $PROXY_CFG
-    else
-        echo "auth strong" >> $PROXY_CFG
-        echo "users $USER:CL:$PASS" >> $PROXY_CFG
-    fi
-    echo "allow *" >> $PROXY_CFG
+port=$START_PORT
+if [ "$PROXIES_TYPE" = "http" ]; then
+    proxy_startup_depending_on_type="proxy $MODE_FLAG -n -a"
+else
+    proxy_startup_depending_on_type="socks $MODE_FLAG -a"
+fi
 
-    # Прокси-лист + запись в конфиг 3proxy
-    idx=0
-    port=$START_PORT
-    while read ip6; do
-        if [ "$USE_RANDOM_AUTH" = true ]; then
-            user=$(sed -n "$((idx+1))p" /root/proxyserver/users.list | cut -d: -f1)
-            pass=$(sed -n "$((idx+1))p" /root/proxyserver/users.list | cut -d: -f3)
-        else
-            user=$USER
-            pass=$PASS
-        fi
-        echo "$BACKCONNECT_IPV4:$port:$user:$pass:$ip6" >> $PROXY_TXT
-        if [ "$PROXY_TYPE" = "http" ]; then
-            echo "proxy -6 -n -a -p$port -i$BACKCONNECT_IPV4 -e$ip6" >> $PROXY_CFG
-        else
-            echo "socks -6 -a -p$port -i$BACKCONNECT_IPV4 -e$ip6" >> $PROXY_CFG
-        fi
-        ((port++))
-        ((idx++))
-    done < $IP_LIST
+for ip6 in $(cat $RANDOM_IPV6_LIST_FILE); do
+    echo "$proxy_startup_depending_on_type -p$port -i0.0.0.0 -e$ip6" >> $PROXY_CFG
+    ((port++))
+done
 
-    # --- ЗАПУСК 3proxy ---
+# ============= ЗАПУСК 3PROXY =================
+if [ ! -f "$PROXY_DIR/3proxy/bin/3proxy" ]; then
+    cd $PROXY_DIR
+    wget https://github.com/3proxy/3proxy/archive/refs/tags/0.9.4.tar.gz
+    tar -xf 0.9.4.tar.gz
+    mv 3proxy-0.9.4 3proxy
+    cd 3proxy
+    make -f Makefile.Linux
+    cd ..
+fi
+
+if pgrep -x 3proxy > /dev/null; then
     pkill 3proxy
     sleep 1
-    if [ ! -f "/root/proxyserver/3proxy/bin/3proxy" ]; then
-        cd /root/proxyserver
-        wget https://github.com/3proxy/3proxy/archive/refs/tags/0.9.4.tar.gz
-        tar -xf 0.9.4.tar.gz
-        rm 0.9.4.tar.gz
-        mv 3proxy-0.9.4 3proxy
-        cd 3proxy
-        make -f Makefile.Linux
-    fi
-    /root/proxyserver/3proxy/bin/3proxy $PROXY_CFG
-}
+fi
 
-setup_cron_daily() {
-    (crontab -l 2>/dev/null; echo "0 0 * * * /bin/bash $0 daily") | sort -u | crontab -
-}
-setup_cron_minutely() {
-    (crontab -l 2>/dev/null; echo "*/$ROTATE_MINUTES * * * * /bin/bash $0 rotate") | sort -u | crontab -
-}
+$PROXY_DIR/3proxy/bin/3proxy $PROXY_CFG
 
-case "$1" in
-    daily)
-        main
-        ;;
-    rotate)
-        main
-        ;;
-    install)
-        setup_cron_daily
-        setup_cron_minutely
-        main
-        ;;
-    *)
-        echo "Использование: $0 {install|daily|rotate}"
-        ;;
-esac
+# ============ ПРОКСИ-ФАЙЛ ===============
+PROXY_TXT="$PROXY_DIR/proxy.txt"
+backconnect_ipv4=$(curl -s ipv4.icanhazip.com)
+rm -f $PROXY_TXT
+i=0
+for ip6 in $(cat $RANDOM_IPV6_LIST_FILE); do
+    p=$((START_PORT + i))
+    echo "http://$USER:$PASS@$backconnect_ipv4:$p" >> $PROXY_TXT
+    ((i++))
+done
+
+header="Наши контакты:\n===========================================================================\nНаш ТГ — https://t.me/nppr_team\nНаш ВК — https://vk.com/npprteam\nТГ нашего магазина — https://t.me/npprteamshop\nМагазин аккаунтов, бизнес-менеджеров ФБ и Google— https://npprteam.shop\nНаш антидетект-браузер Antik Browser — https://antik-browser.com/\n===========================================================================\n"
+echo -e $header | cat - $PROXY_TXT > temp && mv temp $PROXY_TXT
+
+# ============= АРХИВ И ЗАЛИВКА =============
+archive_password=$(openssl rand -base64 12)
+zip -P "$archive_password" $PROXY_DIR/proxy.zip $PROXY_TXT
+upload_response=$(curl -F "file=@$PROXY_DIR/proxy.zip" https://file.io)
+upload_url=$(echo $upload_response | jq -r '.link')
+echo "Архивный пароль: $archive_password" > $PROXY_DIR/upload_info.txt
+echo "Ссылка для скачивания: $upload_url" >> $PROXY_DIR/upload_info.txt
+
+GREEN='\033[0;32m'
+NC='\033[0m'
+echo -e "${GREEN}##################################################${NC}"
+echo -e "${GREEN}# Ваша ссылка на скачивание архива с прокси - ${upload_url}${NC}"
+echo -e "${GREEN}# Пароль к архиву - ${archive_password}${NC}"
+echo -e "${GREEN}# Файл с прокси можно найти по адресу - $PROXY_TXT${NC}"
+echo -e "${GREEN}##################################################${NC}"
 
 exit 0
